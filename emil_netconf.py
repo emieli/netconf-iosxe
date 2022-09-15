@@ -2,6 +2,7 @@ import pexpect
 import xmltodict
 import yaml
 from dataclasses import dataclass
+import json
 
 
 @dataclass
@@ -20,7 +21,7 @@ class Netconf:
 
     def __init__(self, server_ip: str, port: str = "830"):
 
-        self.ssh = self.connect(server_ip, port)
+        self.ssh, self.session_id = self.connect(server_ip, port)
         self.counter = 0
 
     @property
@@ -29,7 +30,7 @@ class Netconf:
         self.counter += 1
         return self.counter
 
-    def connect(self, server_ip, port):
+    def connect(self, server_ip, port) -> object:
         """Setting up netconf SSH connection to server"""
 
         username = "emil"
@@ -40,6 +41,10 @@ class Netconf:
         ssh.sendline(password)
         print("Password entered")
         ssh.expect("]]>]]>")
+
+        output = ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
+        output = xmltodict.parse(output)
+        session_id = output["hello"]["session-id"]
 
         """Sending initial netconf Hello message"""
         message = {
@@ -53,7 +58,7 @@ class Netconf:
         print("Hello message sent")
         ssh.expect("]]>]]>")
 
-        return ssh
+        return ssh, session_id
 
     def discard_changes(self):
 
@@ -91,10 +96,7 @@ class Netconf:
         self.ssh.expect("]]>]]>")  # end of RPC-reply
 
         output = self.ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
-        output = xmltodict.parse(output)
-        if "data" in output["rpc-reply"]:
-            return yaml.dump(output["rpc-reply"]["data"]["interfaces"]["interface"])
-        return yaml.dump(output)
+        return xmltodict.parse(output)
 
     def configure_interface(self, intf: Interface):
 
@@ -133,6 +135,69 @@ class Netconf:
         output = self.ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
         return xmltodict.parse(output)["rpc-reply"]
 
+    def remove_interface_ip(self, interface_name):
+
+        output = self.get_interfaces()
+        for interface in output["rpc-reply"]["data"]["interfaces"]["interface"]:
+            if not interface["name"] == interface_name:
+                continue
+
+            print(interface)
+            del interface["ipv4"]["address"]
+
+            message = {
+                "rpc": {
+                    "@message-id": self.message_id,
+                    "@xmlns": "urn:ietf:params:xml:ns:netconf:base:1.0",
+                    "edit-config": {
+                        "target": {"candidate": None},
+                        "error-option": "rollback-on-error",
+                        "config": {
+                            "@xmlns:xc": "urn:ietf:params:xml:ns:netconf:base:1.0",
+                            "interfaces": {
+                                "@xmlns": "urn:ietf:params:xml:ns:yang:ietf-interfaces",
+                                "interface": [
+                                    {
+                                        "name": "GigabitEthernet2",
+                                        "ipv4": {
+                                            "@xmlns": "urn:ietf:params:xml:ns:yang:ietf-ip",
+                                            "address": {"@xc:operation": "remove", "ip": "10.10.10.10"},
+                                        },
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                },
+            }
+            xml = xmltodict.unparse(message, pretty=True)
+            print(xml)
+            self.ssh.sendline(xml + "]]>]]>")
+            self.ssh.expect("]]>]]>")  # end of RPC message
+            self.ssh.expect("]]>]]>")  # end of RPC-reply
+
+            output = self.ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
+            return xmltodict.parse(output)["rpc-reply"]
+
+    def close_session(self):
+
+        message = {
+            "rpc": {
+                "@message-id": self.message_id,
+                "@xmlns": "urn:ietf:params:xml:ns:netconf:base:1.0",
+                "close-session": None,
+            }
+        }
+
+        xml = xmltodict.unparse(message)
+        print(xml)
+        self.ssh.sendline(xml + "]]>]]>")
+        self.ssh.expect("]]>]]>")  # end of RPC message
+        self.ssh.expect("]]>]]>")  # end of RPC-reply
+
+        output = self.ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
+        return xmltodict.parse(output)
+
     def validate(self):
 
         print("validate")
@@ -153,9 +218,25 @@ class Netconf:
         output = self.ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
         return xmltodict.parse(output)["rpc-reply"]
 
-    def commit(self):
+    def commit_with_confirm(self):
 
-        print("commit")
+        message = {
+            "rpc": {
+                "@message-id": self.message_id,
+                "@xmlns": "urn:ietf:params:xml:ns:netconf:base:1.0",
+                "commit": {"confirmed": None, "confirm-timeout": 20},
+            }
+        }
+
+        xml = xmltodict.unparse(message)
+        self.ssh.sendline(xml + "]]>]]>")
+        self.ssh.expect("]]>]]>")  # end of RPC message
+        self.ssh.expect("]]>]]>")  # end of RPC-reply
+
+        output = self.ssh.before.decode("utf-8").replace('<?xml version="1.0" encoding="UTF-8"?>', "")
+        return xmltodict.parse(output)["rpc-reply"]
+
+    def commit(self):
 
         message = {
             "rpc": {"@message-id": self.message_id, "@xmlns": "urn:ietf:params:xml:ns:netconf:base:1.0", "commit": None}
@@ -193,27 +274,17 @@ def xml_to_dict() -> dict:
 
 
 def main():
-
-    # xml_to_dict()
-    # return
-
     netconf_server = Netconf(server_ip="10.0.0.2")
-
-    output = netconf_server.discard_changes()
-    print(output)
+    netconf_server.discard_changes()
 
     interface = Interface("GigabitEthernet2", "TEST2", "10.10.10.10", "255.255.255.0")
     output = netconf_server.configure_interface(interface)
     print(output)
 
-    interface = Interface("GigabitEthernet3", "TEST3", "11.11.11.11", "255.255.255.0")
-    output = netconf_server.configure_interface(interface)
+    output = netconf_server.commit()
     print(output)
 
-    output = netconf_server.get_interfaces()
-    print(output)
-
-    output = netconf_server.validate()
+    output = netconf_server.remove_interface_ip("GigabitEthernet2")
     print(output)
 
     output = netconf_server.commit()
